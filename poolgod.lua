@@ -8,6 +8,7 @@ local PoolConstants = require(POOL.PoolConstants)
 local PoolPhysics = require(POOL.PoolPhysics)
 local PoolRules = require(POOL.PoolRules)
 local PoolInput = require(POOL.PoolInputController)
+local PoolAimOverlay = require(POOL.PoolAimOverlay)
 
 local R = PoolConstants.BallRadius
 local HALF_W = PoolConstants.PlayWidth / 2
@@ -139,6 +140,31 @@ local function aimOnly(s, shot)
 	PoolInput.SetAimDirection(s.Input, shot.dir)
 end
 
+local function drawGuide(s, shot)
+	local cue = s.Simulation.Balls[PoolConstants.CueBallNumber]
+	if not cue or not s.Overlay then return end
+	local pred
+	local ok = pcall(function()
+		pred = PoolPhysics.PredictShot(s.Simulation, shot.dir, shot.power, Vector2.zero, 1 / 60)
+	end)
+	if not ok or not pred then return end
+	local legal = true
+	pcall(function()
+		legal = pred.Kind ~= "Ball" or not pred.Other or PoolRules.IsLegalFirstContact(s.Rules, s.Simulation, pred.Other)
+	end)
+	pcall(function()
+		PoolAimOverlay.SetVisible(s.Overlay, true)
+		PoolAimOverlay.SetStickVisible(s.Overlay, not (s.View and s.View.Mode) or s.View.Mode == "2D")
+		PoolAimOverlay.Update(s.Overlay, cue.Position, shot.dir, pred, shot.power, PoolConstants.BasePredictionLength, legal)
+	end)
+end
+
+local function hideGuide(s)
+	if s and s.Overlay then
+		pcall(function() PoolAimOverlay.SetVisible(s.Overlay, false) end)
+	end
+end
+
 local function fire(s, shot)
 	PoolInput.SetAimDirection(s.Input, shot.dir)
 	local needs = false
@@ -246,6 +272,7 @@ local function manual(shoot)
 	end
 	shotInfo.Text = string.format("AIM: %d -> %s  p%.2f", shot.ball, tostring(shot.pocket), shot.power)
 	aimOnly(s, shot)
+	drawGuide(s, shot)
 	if shoot then
 		if state.busy then return end
 		state.busy = true
@@ -267,6 +294,12 @@ table.insert(conns, UIS.InputBegan:Connect(function(input, gp)
 	elseif input.KeyCode == Enum.KeyCode.J then
 		state.auto = not state.auto
 		paintAuto()
+	elseif input.KeyCode == Enum.KeyCode.R then
+		local s = getSeat()
+		if s then
+			pcall(function() PoolInput.ReleaseAim(s.Input) end)
+			hideGuide(s)
+		end
 	elseif input.KeyCode == Enum.KeyCode.RightShift then
 		panel.Visible = not panel.Visible
 	end
@@ -286,6 +319,8 @@ table.insert(conns, RS.RenderStepped:Connect(function()
 		local shot = computeShot(s)
 		if shot then
 			shotInfo.Text = string.format("AUTO: %d -> %s", shot.ball, tostring(shot.pocket))
+			aimOnly(s, shot)
+			drawGuide(s, shot)
 			state.busy = true
 			state.nextAuto = now + 2.5
 			task.spawn(function()
@@ -303,6 +338,8 @@ _G.__poolGod = {
 	getSeat = getSeat,
 	computeShot = computeShot,
 	fire = fire,
+	drawGuide = drawGuide,
+	hideGuide = hideGuide,
 	gui = gui,
 	destroy = function()
 		for _, c in ipairs(conns) do
