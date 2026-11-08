@@ -19,8 +19,9 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/celineasher/pool-god/
 | Key | Action |
 | --- | --- |
 | `G` | Aim + shoot the best shot |
-| `H` | Aim only (preview) |
+| `H` | Aim only (draws the guide line) |
 | `J` | Toggle auto-shot |
+| `R` | Release aim / hide guide |
 | `RightShift` | Show / hide panel |
 
 The panel also has AUTO SHOT / AIM ONLY / SHOOT buttons.
