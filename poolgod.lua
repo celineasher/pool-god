@@ -9,6 +9,7 @@ local PoolPhysics = require(POOL.PoolPhysics)
 local PoolRules = require(POOL.PoolRules)
 local PoolInput = require(POOL.PoolInputController)
 local PoolAimOverlay = require(POOL.PoolAimOverlay)
+local PoolTableRenderer2D = require(POOL.PoolTableRenderer2D)
 
 local R = PoolConstants.BallRadius
 local HALF_W = PoolConstants.PlayWidth / 2
@@ -90,11 +91,87 @@ local function ourTurn(s)
 	return ok and pm and pm.Phase == "Playing" and pm.Turn == s.Seat
 end
 
+local function raySegT(p, d, a, b)
+	local e = b - a
+	local den = d.X * e.Y - d.Y * e.X
+	if math.abs(den) < 1e-9 then return nil end
+	local ap = a - p
+	local t = (ap.X * e.Y - ap.Y * e.X) / den
+	local u = (ap.X * d.Y - ap.Y * d.X) / den
+	if t > 1e-4 and u >= 0 and u <= 1 then return t end
+end
+
+local function rayCircleT(p, d, c, r)
+	local m = p - c
+	local b = m:Dot(d)
+	local cc = m:Dot(m) - r * r
+	local disc = b * b - cc
+	if disc < 0 then return nil end
+	local root = math.sqrt(disc)
+	local t = -b - root
+	if t < 0 then t = -b + root end
+	if t >= 0 then return t end
+end
+
+local function getCushions(sim)
+	local ok, c = pcall(function() return PoolPhysics.GetTable(sim).Cushions end)
+	return ok and c or {}
+end
+
+local function bankCandidate(sim, cue, ball, pk, cushion)
+	local A, B, N = cushion.A, cushion.B, cushion.Normal
+	if not A or not B or not N then return nil end
+	local n = N.Unit
+	local target = pk.MouthCentre
+	local sideBall = (ball.Position - A):Dot(n)
+	local sidePocket = (target - A):Dot(n)
+	if sideBall * sidePocket <= 0 then return nil end
+	local mirror = target - n * (2 * sidePocket)
+	local toM = mirror - ball.Position
+	local dm = toM.Magnitude
+	if dm < 1e-3 then return nil end
+	local d = toM / dm
+	local qt = raySegT(ball.Position, d, A, B)
+	if not qt then return nil end
+	local q = ball.Position + d * qt
+	local qp = target - q
+	local qpd = qp.Magnitude
+	if qpd < 1e-3 then return nil end
+	local refl = d - n * (2 * d:Dot(n))
+	if refl.Unit:Dot(qp.Unit) < 0.9 then return nil end
+	if not isClear(sim, ball.Position, q, ball.Number) then return nil end
+	if not isClear(sim, q, target, ball.Number) then return nil end
+	local ghost = ball.Position - d * (R * 2.02)
+	if math.abs(ghost.X) > HALF_W - R or math.abs(ghost.Y) > HALF_H - R then return nil end
+	local toGhost = ghost - cue.Position
+	local gd = toGhost.Magnitude
+	if gd < 1e-3 then return nil end
+	local adir = toGhost / gd
+	local cut = adir:Dot(d)
+	if cut <= 0.25 then return nil end
+	if not isClear(sim, cue.Position, ghost, ball.Number) then return nil end
+	local dist = gd + qt + qpd
+	return {
+		dir = adir,
+		power = math.clamp(0.62 + dist / 150, 0.6, 1),
+		score = dist / (cut * cut) + 20,
+		bank = true,
+		ball = ball.Number,
+		pocket = pk.Id,
+		objPos = ball.Position,
+		pocketPos = target,
+		contact = q,
+		rail = cushion.Id,
+		ghost = ghost,
+	}
+end
+
 local function computeShot(s)
 	local sim = s.Simulation
 	local cue = sim.Balls[PoolConstants.CueBallNumber]
 	if not cue or cue.Pocketed then return nil end
 	local cpos = cue.Position
+	local cushions = getCushions(sim)
 	local best
 	for _, ball in pairs(sim.Balls) do
 		if type(ball) == "table" and ball.Number and ball.Number > 0 and not ball.Pocketed and ball.Position then
@@ -121,11 +198,21 @@ local function computeShot(s)
 											dir = adir,
 											power = math.clamp(0.55 + (gd + pd) / 140, 0.55, 0.95),
 											score = score,
+											bank = false,
 											ball = ball.Number,
 											pocket = pk.Id,
+											objPos = ball.Position,
+											pocketPos = mouth,
+											ghost = ghost,
 										}
 									end
 								end
+							end
+						end
+						for _, cushion in ipairs(cushions) do
+							local cand = bankCandidate(sim, cue, ball, pk, cushion)
+							if cand and (not best or cand.score < best.score) then
+								best = cand
 							end
 						end
 					end
@@ -140,6 +227,78 @@ local function aimOnly(s, shot)
 	PoolInput.SetAimDirection(s.Input, shot.dir)
 end
 
+local function traceCue(sim, start, dir, maxLen, maxBounces)
+	local pts = { start }
+	local p = start
+	local d = dir.Unit
+	local left = maxLen
+	local bounces = 0
+	local cushions = getCushions(sim)
+	while left > 0.05 and bounces <= maxBounces do
+		local bestT = left
+		local kind, normal
+		for _, ball in pairs(sim.Balls) do
+			if type(ball) == "table" and ball.Number and ball.Number ~= PoolConstants.CueBallNumber
+				and not ball.Pocketed and ball.Position then
+				local t = rayCircleT(p, d, ball.Position, R * 2)
+				if t and t < bestT then bestT = t; kind = "ball"; normal = nil end
+			end
+		end
+		for _, c in ipairs(cushions) do
+			local t = raySegT(p, d, c.A, c.B)
+			if t and t < bestT then bestT = t; kind = "cushion"; normal = c.Normal.Unit end
+		end
+		local hit = p + d * bestT
+		pts[#pts + 1] = hit
+		if kind ~= "cushion" or not normal then break end
+		left = left - bestT
+		d = (d - normal * (2 * d:Dot(normal))).Unit
+		p = hit + d * 0.02
+		bounces = bounces + 1
+	end
+	return pts
+end
+
+local function guideFolder(s)
+	if not s.Overlay or not s.Overlay.Root then return nil end
+	local f = s.Overlay.Root:FindFirstChild("BankGuide")
+	if not f then
+		f = Instance.new("Folder")
+		f.Name = "BankGuide"
+		f.Parent = s.Overlay.Root
+	end
+	return f
+end
+
+local function clearGuide(s)
+	local f = s and s.Overlay and s.Overlay.Root and s.Overlay.Root:FindFirstChild("BankGuide")
+	if f then f:ClearAllChildren() end
+end
+
+local function drawSeg(folder, a, b, thick, color, transparency)
+	local fs = PoolTableRenderer2D.GetFrameSize()
+	local d = b - a
+	local len = d.Magnitude
+	if len < 0.05 then return end
+	local mid = (a + b) / 2
+	local f = Instance.new("Frame")
+	f.AnchorPoint = Vector2.new(0.5, 0.5)
+	f.Position = UDim2.fromScale(0.5 + mid.X / fs.X, 0.5 - mid.Y / fs.Y)
+	f.Size = UDim2.fromScale(len / fs.X, thick / fs.Y)
+	f.Rotation = math.deg(math.atan2(-d.Y, d.X))
+	f.BackgroundColor3 = color
+	f.BackgroundTransparency = transparency or 0.1
+	f.BorderSizePixel = 0
+	f.ZIndex = 33
+	f.Parent = folder
+end
+
+local function drawPoly(folder, pts, thick, color, transparency)
+	for i = 1, #pts - 1 do
+		drawSeg(folder, pts[i], pts[i + 1], thick, color, transparency)
+	end
+end
+
 local function drawGuide(s, shot)
 	local cue = s.Simulation.Balls[PoolConstants.CueBallNumber]
 	if not cue or not s.Overlay then return end
@@ -147,20 +306,47 @@ local function drawGuide(s, shot)
 	local ok = pcall(function()
 		pred = PoolPhysics.PredictShot(s.Simulation, shot.dir, shot.power, Vector2.zero, 1 / 60)
 	end)
-	if not ok or not pred then return end
-	local legal = true
-	pcall(function()
-		legal = pred.Kind ~= "Ball" or not pred.Other or PoolRules.IsLegalFirstContact(s.Rules, s.Simulation, pred.Other)
-	end)
-	pcall(function()
-		PoolAimOverlay.SetVisible(s.Overlay, true)
-		PoolAimOverlay.SetStickVisible(s.Overlay, not (s.View and s.View.Mode) or s.View.Mode == "2D")
-		PoolAimOverlay.Update(s.Overlay, cue.Position, shot.dir, pred, shot.power, PoolConstants.BasePredictionLength, legal)
-	end)
+	if ok and pred then
+		local legal = true
+		pcall(function()
+			legal = pred.Kind ~= "Ball" or not pred.Other or PoolRules.IsLegalFirstContact(s.Rules, s.Simulation, pred.Other)
+		end)
+		pcall(function()
+			PoolAimOverlay.SetVisible(s.Overlay, true)
+			PoolAimOverlay.SetStickVisible(s.Overlay, not (s.View and s.View.Mode) or s.View.Mode == "2D")
+			PoolAimOverlay.Update(s.Overlay, cue.Position, shot.dir, pred, shot.power, PoolConstants.BasePredictionLength, legal)
+		end)
+	end
+
+	local folder = guideFolder(s)
+	if not folder then return end
+	clearGuide(s)
+
+	local cuePts = traceCue(s.Simulation, cue.Position, shot.dir, 42, 3)
+	drawPoly(folder, cuePts, 0.55, Color3.fromRGB(124, 200, 255), 0.15)
+
+	if shot.bank and shot.objPos and shot.contact and shot.pocketPos then
+		drawSeg(folder, shot.objPos, shot.contact, 0.85, Color3.fromRGB(255, 201, 74), 0.05)
+		drawSeg(folder, shot.contact, shot.pocketPos, 0.85, Color3.fromRGB(255, 201, 74), 0.05)
+		local fs = PoolTableRenderer2D.GetFrameSize()
+		local dot = Instance.new("Frame")
+		dot.AnchorPoint = Vector2.new(0.5, 0.5)
+		dot.Position = UDim2.fromScale(0.5 + shot.contact.X / fs.X, 0.5 - shot.contact.Y / fs.Y)
+		dot.Size = UDim2.fromScale((R * 2.4) / fs.X, (R * 2.4) / fs.Y)
+		dot.BackgroundColor3 = Color3.fromRGB(255, 201, 74)
+		dot.BackgroundTransparency = 0.2
+		dot.BorderSizePixel = 0
+		dot.ZIndex = 34
+		Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+		dot.Parent = folder
+	elseif shot.objPos and shot.pocketPos then
+		drawSeg(folder, shot.objPos, shot.pocketPos, 0.55, Color3.fromRGB(124, 255, 107), 0.2)
+	end
 end
 
 local function hideGuide(s)
 	if s and s.Overlay then
+		clearGuide(s)
 		pcall(function() PoolAimOverlay.SetVisible(s.Overlay, false) end)
 	end
 end
@@ -270,7 +456,7 @@ local function manual(shoot)
 		shotInfo.Text = "AIM: no shot"
 		return
 	end
-	shotInfo.Text = string.format("AIM: %d -> %s  p%.2f", shot.ball, tostring(shot.pocket), shot.power)
+	shotInfo.Text = string.format("%s: %d -> %s  p%.2f", shot.bank and "BANK" or "AIM", shot.ball, tostring(shot.pocket), shot.power)
 	aimOnly(s, shot)
 	drawGuide(s, shot)
 	if shoot then
@@ -318,7 +504,7 @@ table.insert(conns, RS.RenderStepped:Connect(function()
 	if state.auto and not state.busy and mine and s.Simulation.Settled and now >= state.nextAuto then
 		local shot = computeShot(s)
 		if shot then
-			shotInfo.Text = string.format("AUTO: %d -> %s", shot.ball, tostring(shot.pocket))
+			shotInfo.Text = string.format("AUTO %s: %d -> %s", shot.bank and "BANK" or "", shot.ball, tostring(shot.pocket))
 			aimOnly(s, shot)
 			drawGuide(s, shot)
 			state.busy = true
@@ -337,6 +523,9 @@ _G.__poolGod = {
 	state = state,
 	getSeat = getSeat,
 	computeShot = computeShot,
+	bankCandidate = bankCandidate,
+	traceCue = traceCue,
+	getCushions = getCushions,
 	fire = fire,
 	drawGuide = drawGuide,
 	hideGuide = hideGuide,
